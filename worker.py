@@ -183,7 +183,7 @@ def runner(sleep_duration):
         for post in posts:
             message = parse_post(r, p, post)
             send_to_slack(message)
-            time.sleep(sleep_duration)
+        time.sleep(sleep_duration)
 
 
 runner(config.sleep_duration)
