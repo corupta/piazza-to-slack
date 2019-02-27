@@ -4,16 +4,22 @@ import requests
 from dateutil import parser
 from piazza_api import Piazza
 from htmlslacker import HTMLSlacker
-from urllib.parse import urlparse
 import time
+from urllib.parse import urlparse
 import redis
+import psycopg2
 
 import config
+import html
 
 
-def connect_to_redis():
-    url = urlparse(config.redis_cloud_url)
-    return redis.Redis(host=url.hostname, port=url.port, password=url.password)
+def connect_to_pg():
+    return psycopg2.connect(config.pg_database_url, sslmode='require')
+
+
+# def connect_to_redis():
+#    url = urlparse(config.redis_cloud_url)
+#    return redis.Redis(host=url.hostname, port=url.port, password=url.password)
 
 
 def connect_to_piazza():
@@ -22,21 +28,20 @@ def connect_to_piazza():
     return p.network(network_id=config.piazza_class_id)
 
 
-def get_post_last_change(r, post_id):
-    key = "POST-{}".format(post_id)
-    try:
-        return r.get(key)
-    except redis.RedisError:
-        print("Redis Error on get post last change on {}".format(key))
-        return ""
+def get_post_last_change(curr, post_id):
+    curr.execute("SELECT last_change FROM posts WHERE id=%s", (post_id,))
+
+    res = curr.fetchone()
+    if res:
+        return res[0]
+    else:
+        return None
 
 
-def set_post_last_change(r, post_id, last_change):
-    key = "POST-{}".format(post_id)
-    try:
-        return r.set(key, last_change)
-    except redis.RedisError:
-        print("Redis Error on set post last change on {}".format(key))
+def set_post_last_change(curr, post_id, last_change):
+    print("setting post last change", post_id, last_change)
+    curr.execute("INSERT INTO posts (id, last_change) VALUES (%s, %s) ON CONFLICT (id) DO UPDATE SET last_change = %s",
+                 (post_id, last_change, last_change))
 
 
 def send_to_slack(payload):
@@ -47,7 +52,8 @@ def parse_content(content):
     content = re.sub(r'<strong>(\W*)</strong>', r'\g<1>', content)
     content = re.sub(r'<(/?)p>', r'<\g<1>span>', content)
     content = re.sub(r'(</li>|<ol>|<ul>|\n)', r'\g<1><br />', content)
-    return HTMLSlacker(content).get_output()
+    content = HTMLSlacker(content).get_output()
+    return html.unescape(content)
 
 
 def parse_subject(subject):
@@ -91,13 +97,13 @@ def entity_to_attachment(entity):
     return attachment
 
 
-def parse_post(r, p, post):
+def parse_post(curr, p, post):
     post_id = post["nr"]
-    last_change = get_post_last_change(r, post_id)
+    last_change = get_post_last_change(curr, post_id)
     change_log = post["change_log"]
     if change_log[-1]["when"] == last_change:
         return
-    set_post_last_change(r, post_id, change_log[-1]["when"])
+    set_post_last_change(curr, post_id, change_log[-1]["when"])
 
     children = dict()
     children[post["created"]] = children[post["history"][-1]["created"]] = {
@@ -175,14 +181,21 @@ def parse_post(r, p, post):
 
 
 def runner(sleep_duration):
-    r = connect_to_redis()
+    # r = connect_to_redis()
+    pg_con = connect_to_pg()
     p = connect_to_piazza()
 
     while True:
         posts = p.iter_all_posts()
         for post in posts:
-            message = parse_post(r, p, post)
-            send_to_slack(message)
+            try:
+                curr = pg_con.cursor()
+                message = parse_post(curr, p, post)
+                send_to_slack(message)
+                pg_con.commit()
+                curr.close()
+            except Exception as e:
+                print("Some error happened in the post", post["nr"], ":\n", e)
         time.sleep(sleep_duration)
 
 

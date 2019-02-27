@@ -3,3 +3,4 @@ requests
 redis
 python-dateutil
 html-slacker
+psycopg2-binary
