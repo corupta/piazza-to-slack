@@ -3,36 +3,55 @@ import re
 import requests
 from dateutil import parser
 from piazza_api import Piazza
+from htmlslacker import HTMLSlacker
+from urllib.parse import urlparse
+import time
+import redis
 
 import config
 
 
-def get_post_last_change(post_id):
-    return 'a'
+def connect_to_redis():
+    url = urlparse(config.redis_cloud_url)
+    return redis.Redis(host=url.hostname, port=url.port, password=url.password)
 
 
-def set_post_last_change(post_id, last_change):
-    pass
+def connect_to_piazza():
+    p = Piazza()
+    p.user_login(email=config.piazza_email, password=config.piazza_password)
+    return p.network(network_id=config.piazza_class_id)
+
+
+def get_post_last_change(r, post_id):
+    key = "POST-{}".format(post_id)
+    try:
+        return r.get(key)
+    except redis.RedisError:
+        print("Redis Error on get post last change on {}".format(key))
+        return ""
+
+
+def set_post_last_change(r, post_id, last_change):
+    key = "POST-{}".format(post_id)
+    try:
+        return r.set(key, last_change)
+    except redis.RedisError:
+        print("Redis Error on set post last change on {}".format(key))
 
 
 def send_to_slack(payload):
     requests.post(url=config.slack_hook_url, json=payload)
 
 
-def connect_to_piazza():
-    p = Piazza()
-    p.user_login(email=config.piazza_email, password=config.piazza_password);
-    return p.network(network_id=config.piazza_class_id)
+def parse_content(content):
+    content = re.sub(r'<strong>(\W*)</strong>', r'\g<1>', content)
+    content = re.sub(r'<(/?)p>', r'<\g<1>span>', content)
+    content = re.sub(r'(</li>|<ol>|<ul>|\n)', r'\g<1><br />', content)
+    return HTMLSlacker(content).get_output()
 
 
-## todo improve html decoding
-
-def strip_p_html(str):
-    return re.sub(r'</?p>', '', str)
-
-
-def strip_all_html(str):
-    return re.sub(r'</?\w+>', '', str)
+def parse_subject(subject):
+    return re.sub(r'\n+', ' ', subject)[:20]
 
 
 def entity_to_attachment(entity):
@@ -58,49 +77,54 @@ def entity_to_attachment(entity):
         attachment["color"] = "#DDDDDD"
         attachment["pretext"] = "Something else? - {}".format(content.get("parent_subject", content["subject"]))
 
-    attachment["fallback"] = strip_all_html(content["content"])
-    attachment["title"] = strip_all_html(content["subject"])
+    attachment["fallback"] = content["content"]
+    if content["subject"]:
+        attachment["title"] = content["subject"]
     # attachment["title_link"] = 'there's no link for individual feedbacks/followups
-    attachment["text"] = strip_p_html(content["content"])
+    attachment["text"] = content["content"]
     attachment["footer"] = "{} ~ {} ~ {}".format(user["name"], user["class_sections"], user["role"])
     if user["photo_url"]:
         attachment["footer_icon"] = user["photo_url"]
     attachment["ts"] = int(when.timestamp())
+    attachment["mrkdwn_in"] = ["text"]
 
     return attachment
 
 
-def parse_post(p, post_id):
-    last_change = get_post_last_change(post_id)
-    post = p.get_post(post_id)
+def parse_post(r, p, post):
+    post_id = post["nr"]
+    last_change = get_post_last_change(r, post_id)
     change_log = post["change_log"]
     if change_log[-1]["when"] == last_change:
         return
+    set_post_last_change(r, post_id, change_log[-1]["when"])
 
     children = dict()
     children[post["created"]] = children[post["history"][-1]["created"]] = {
         "parent_subject": None,
         "data": post["data"],
-        "subject": post["history"][-1]["subject"],
-        "content": post["history"][-1]["content"],
+        "subject": parse_content(post["history"][-1]["subject"]),
+        "content": parse_content(post["history"][-1]["content"]),
         "folders": post["folders"],
         "type": post["type"]
     }
     for followup in post["children"]:
+        followup_content = parse_content(followup["subject"])
         children[followup["created"]] = children[followup["updated"]] = {
-            "parent_subject": post["history"][-1]["subject"],
+            "parent_subject": parse_subject(children[post["created"]]["subject"]),
             "data": followup["data"],
-            "subject": strip_all_html(followup["subject"])[:40],
-            "content": followup["subject"],
+            "subject": None,
+            "content": followup_content,
             "folders": followup["folders"],
             "type": "followup"
         }
         for feedback in followup["children"]:
+            feedback_content = parse_content(feedback["subject"])
             children[feedback["created"]] = children[feedback["updated"]] = {
-                "parent_subject": strip_all_html(followup["subject"])[:40],
+                "parent_subject": parse_subject(followup_content),
                 "data": feedback["data"],
-                "subject": strip_all_html(feedback["subject"])[:40],
-                "content": feedback["subject"],
+                "subject": None,
+                "content": feedback_content,
                 "type": "feedback"
             }
 
@@ -130,7 +154,7 @@ def parse_post(p, post_id):
         users[user["id"]] = {
             "name": user["name"],
             "role": user["role"],
-            "class_sections":  ', '.join(user.get("class_sections", "")),
+            "class_sections":  ', '.join(map(lambda x: x[:8], user.get("class_sections", []))),
             "photo_url": user.get("photo_url", None)
         }
 
@@ -139,7 +163,7 @@ def parse_post(p, post_id):
         entity["user"] = users[entity["uid"]]
         attachments.append(entity_to_attachment(entity))
 
-    tags = ", ".join(map(lambda tag: "({})".format(tag), post.get("tags", [])))
+    tags = " ".join(map(lambda tag: "`{}`".format(tag), post.get("tags", [])))
     text = "<https://piazza.com/class/{}?cid={}|{}> {}"\
         .format(config.piazza_class_id, post_id, post["history"][-1]["subject"], tags)
 
@@ -150,14 +174,16 @@ def parse_post(p, post_id):
     return message
 
 
-def runner():
+def runner(sleep_duration):
+    r = connect_to_redis()
     p = connect_to_piazza()
 
-    message = parse_post(p, 7)
-    send_to_slack(message)
-    # stuff = p.get_post(7)
-    f = open("tmp", "w")
-    json.dump(message, f)
+    while True:
+        posts = p.iter_all_posts()
+        for post in posts:
+            message = parse_post(r, p, post)
+            send_to_slack(message)
+            time.sleep(sleep_duration)
 
 
-runner()
+runner(config.sleep_duration)

@@ -2,3 +2,4 @@ piazza_api
 requests
 redis
 python-dateutil
+html-slacker
